@@ -8,7 +8,8 @@
             [metrics.timers :as t]
             [metrics.gauges :as g]
             [metrics.meters :as m])
-  (:import [java.util.concurrent TimeUnit]))
+  (:import [java.util.concurrent TimeUnit]
+           [com.codahale.metrics JmxReporter]))
 
 (defn new-lifecycle-latency [reg job-name task-name id lifecycle]
   (let [timer ^com.codahale.metrics.Timer (t/timer reg ["job" job-name "task" task-name "peer-id" 
@@ -49,8 +50,8 @@
     (c/inc! cnt-epoch (- (task/epoch state) (c/value cnt-epoch)))))
 
 ;; FIXME, close counters and remove them from the registry
-(defn before-task [{:keys [onyx.core/job-id onyx.core/id onyx.core/monitoring
-                           onyx.core/task] :as event} 
+(defn before-task [{:keys [onyx.core/job-id onyx.core/id 
+                           onyx.core/monitoring onyx.core/task] :as event} 
                    lifecycle] 
   (when (:metrics/workflow-name lifecycle)
     (throw (ex-info ":metrics/workflow-name has been deprecated. Use job metadata such as:
@@ -63,24 +64,32 @@
                          :lifecycle/apply-fn :lifecycle/unblock-subscribers})
         job-name (str (get-in event [:onyx.core/task-information :metadata :name] job-id))
         task-name (name (:onyx.core/task event))
-        reg (:registry monitoring)
-        _ (when-not reg (throw (Exception. "Monitoring component is not setup")))
-        cnt-replica-version (c/counter reg ["job" job-name "task" task-name "peer-id" (str id) "replica-version"])
-        cnt-epoch (c/counter reg ["job" job-name "task" task-name "peer-id" (str id) "epoch"])
-        epoch-rate (m/meter reg ["job" job-name "task" task-name "peer-id" (str id) "epoch-rate"])
-        update-rv-epoch-fn (update-rv-epoch cnt-replica-version cnt-epoch epoch-rate)]
-    {:onyx.core/monitoring (reduce 
-                            (fn [mon lifecycle]
-                              (assoc mon 
-                                     lifecycle 
-                                     (case lifecycle
-                                       :lifecycle/unblock-subscribers update-rv-epoch-fn
-                                       :lifecycle/read-batch (new-read-batch reg job-name task-name id :lifecycle/read-batch) 
-                                       :lifecycle/write-batch (new-write-batch reg job-name task-name id :lifecycle/write-batch) 
-                                       (new-lifecycle-latency reg job-name task-name id lifecycle))))
-                            monitoring
-                            lifecycles)}))
+        task-registry (new-registry)
+        cnt-replica-version (c/counter task-registry ["job" job-name "task" task-name "peer-id" (str id) "replica-version"])
+        cnt-epoch (c/counter task-registry ["job" job-name "task" task-name "peer-id" (str id) "epoch"])
+        epoch-rate (m/meter task-registry ["job" job-name "task" task-name "peer-id" (str id) "epoch-rate"])
+        update-rv-epoch-fn (update-rv-epoch cnt-replica-version cnt-epoch epoch-rate)
+        reporter (.build (JmxReporter/forRegistry task-registry))
+        _ (.start ^JmxReporter reporter)]
+    {:onyx.core/monitoring (assoc (reduce 
+                                   (fn [mon lifecycle]
+                                     (assoc mon 
+                                            lifecycle 
+                                            (case lifecycle
+                                              :lifecycle/unblock-subscribers update-rv-epoch-fn
+                                              :lifecycle/read-batch (new-read-batch task-registry job-name task-name id :lifecycle/read-batch) 
+                                              :lifecycle/write-batch (new-write-batch task-registry job-name task-name id :lifecycle/write-batch) 
+                                              (new-lifecycle-latency task-registry job-name task-name id lifecycle))))
+                                   monitoring
+                                   lifecycles)
+                                  :task-registry task-registry
+                                  :reporter reporter)}))
+
+(defn after-task [{:keys [onyx.core/monitoring]} lifecycle]
+  (-> monitoring :task-registry metrics.core/remove-all-metrics) 
+  (.stop ^JmxReporter (:reporter monitoring)) 
+  {})
 
 (def calls
-  {:lifecycle/before-task-start before-task})
-
+  {:lifecycle/after-task-stop after-task
+   :lifecycle/before-task-start before-task})

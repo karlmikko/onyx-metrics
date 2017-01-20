@@ -157,10 +157,8 @@
 
                               {:lifecycle/task :out
                                :lifecycle/calls ::out-calls}]
-
                   _ (doseq [n (range n-messages)]
                       (>!! @in-chan {:n n}))
-                  _ (close! @in-chan)
                   start-time (System/currentTimeMillis)
                   job (onyx.api/submit-job peer-config
                                            {:catalog catalog
@@ -168,9 +166,14 @@
                                             :workflow workflow
                                             :lifecycles lifecycles
                                             :task-scheduler :onyx.task-scheduler/balanced})
+                  _ (Thread/sleep 5000)
+                  ;; should have task metrics
+                  _ (is (> (count (jmx/mbean-names "metrics:*")) 50))
+                  _ (close! @in-chan)
                   _ (onyx.test-helper/feedback-exception! peer-config (:job-id job))
                   results (take-segments! out-chan 50)
                   end-time (System/currentTimeMillis)]
               (let [expected (set (map (fn [x] {:n (inc x)}) (range n-messages)))]
                 (is (= expected (set results)))
-                (is (> (count (jmx/mbean-names "metrics:*")) 50))))))))))
+                  ;; task metrics shoudl be gone
+                (is (< (count (jmx/mbean-names "metrics:*")) 50))))))))))
